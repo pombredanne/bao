@@ -315,7 +315,81 @@ impl<R: Read> Read for RadReader<R> {
 }
 
 impl<R: Read + Seek> Seek for RadReader<R> {
-    fn seek(&mut self, _: io::SeekFrom) -> io::Result<u64> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        // TODO: Lots of overflow hygiene.
+        let header = self.get_header()?;
+        let current_offset = self.chunk_start + self.chunk.position();
+        let seek_offset = match pos {
+            io::SeekFrom::Start(n) => n,
+            io::SeekFrom::End(n) => {
+                if n + (header.len as i64) < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid seek to a negative or overflowing position",
+                    ));
+                }
+                (header.len as i64 + n) as u64
+            }
+            io::SeekFrom::Current(n) => {
+                if n + (current_offset as i64) < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid seek to a negative or overflowing position",
+                    ));
+                }
+                (current_offset as i64 + n) as u64
+            }
+        };
+
+        if seek_offset > header.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek past the length of the output",
+            ));
+        }
+
+        // If the seek is inside the current chunk, set the chunk position and exit. As a special
+        // case, the position right after the end of the last chunk is considered "inside" it. This
+        // all gets skipped if there is no current chunk (a new decoder, or a previous IO error).
+        let chunk_len = self.chunk.get_ref().len() as u64;
+        let chunk_end = self.chunk_start + chunk_len;
+        let is_last_chunk = chunk_end == header.len;
+        if self.chunk_start <= seek_offset && seek_offset < chunk_end {
+            let seek_chunk_position = seek_offset % CHUNK_SIZE as u64;
+            self.chunk.set_position(seek_chunk_position);
+            return Ok(seek_offset);
+        } else if is_last_chunk && seek_offset == chunk_end {
+            self.chunk.set_position(chunk_len);
+            return Ok(seek_offset);
+        }
+
+        // Seek is not inside the current chunk. Clear the chunk. (It's important to do this before
+        // hopping around nodes, because an IO error later could make us quit in an intermediate
+        // state, and then the chunk would be wrong.)
+        self.chunk.get_mut().clear();
+        self.chunk.set_position(0);
+
+        // Now, pop off all nodes that don't contain the new offset. Again the very end of the
+        // output is considered inside the right edge nodes.
+        while let Some(&current_node) = self.node_stack.last() {
+            let node_start = current_node.left.start;
+            let node_end = current_node.right.start + current_node.right.len;
+            let node_too_far_right = seek_offset < node_start;
+            let node_too_far_left = node_end < header.len && node_end < seek_offset;
+            if node_too_far_right || node_too_far_left {
+                self.node_stack.pop();
+                debug_assert!(self.node_stack.len() > 0, "never pop the last node");
+            } else {
+                break;
+            }
+        }
+
+        // decend left and right, following the target, until we're in a chunk
+        //
+        // read the chunk
+        //
+        // adjust the chunk offset
+
         unimplemented!();
     }
 }
